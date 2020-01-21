@@ -21,14 +21,13 @@ namespace McDuck.Shibari
                 CheckOptions(options);
 
                 // 2. Load the assemblies that should be present in GAC on this system, for the framework declared by the user
-                var (gacAssemblies, gacAssembliesByName) = GetGacAssemblies(options);
+                var (gacAssemblies, gacAssembliesByName) = GetGacAssemblies();
 
                 // 3. Perform the dll scan and obtain the data about assemblies present and required
-                var (_, availableWhere, required, requiredBy, availableVersions) = ScanForAssemblies(options);
+                var (_, availableWhere, required, requiredBy, availableVersions) = ScanForAssemblies(options, gacAssemblies);
 
                 // 4. Process data
-                // 4.1 Remove from required the assemblies which are expected to be in GAC
-                required.ExceptWith(gacAssemblies);
+                // (Removed)
 
                 // 5. Find assemblies which require bindings
                 var requiredMappings = required
@@ -91,7 +90,7 @@ namespace McDuck.Shibari
 
         }
 
-        private static IEnumerable<string> FindMissing(HashSet<AssemblyDesc> required, Dictionary<string, Version[]> availableVersions, IDictionary<string, AssemblyDesc> gacAssembliesByName, Dictionary<string, List<AssemblyDesc>> requiredBy)
+        private static IEnumerable<string> FindMissing(HashSet<AssemblyDesc> required, Dictionary<string, Version[]> availableVersions, IDictionary<string, Dictionary<Version, AssemblyDesc>> gacAssembliesByName, Dictionary<string, List<AssemblyDesc>> requiredBy)
         {
             return required.GroupBy(a => a.Name)
                 .Where(g => !availableVersions.ContainsKey(g.Key))
@@ -104,9 +103,6 @@ namespace McDuck.Shibari
         {
             if(!Directory.Exists(options.PathToDir))
                 throw new DirectoryNotFoundException($"Cannot find the target application directory: '{options.PathToDir}'");
-
-            if (!(options.Core || options.Framework))
-                throw new ArgumentException("Either Core or Framework option must be specified");
         }
 
         private static string GetConfigFilePath(Options options)
@@ -171,39 +167,23 @@ namespace McDuck.Shibari
             return path;
         }
 
-        private static (ISet<AssemblyDesc> gacAssemblies,IDictionary<string,AssemblyDesc> gacAssembliesByName) GetGacAssemblies(Options options)
+        private static (ISet<AssemblyDesc> gacAssemblies,IDictionary<string,Dictionary<Version, AssemblyDesc>> gacAssembliesByName) GetGacAssemblies()
         {
-            var pathToAssemblyList = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                Constants.ReferenceAssembliesPath,
-                options.Core 
-                    ? Constants.FrameworkDir.DotNetCore 
-                    : Constants.FrameworkDir.NetFramework,
-                $"v{options.FrameworkVersion}",
-                Constants.RedistListPath,
-                Constants.RedistListFileName
-            );
+            var gacAssemblies = GacInfo.LoadKnownAssemblies();
 
-            Console.WriteLine($"Loading GAC assemblies from: '{pathToAssemblyList}'");
-
-            if(!File.Exists(pathToAssemblyList))
-                throw new FileNotFoundException($"Cannot find redistributable assembly list file at expected path '{pathToAssemblyList}'");
-
-            var gacAssemblies = XDocument.Load(pathToAssemblyList)
-                .Root
-                .Elements("File")
-                .Where(xe => bool.Parse(xe.Attribute("InGac").Value))
-                .Select(xe => new AssemblyDesc(xe.Attribute("AssemblyName").Value, xe.Attribute("Version").Value, xe.Attribute("PublicKeyToken").Value))
-                .ToHashSet();
-
-            var gacAssembliesByName = gacAssemblies.ToDictionary(a => a.Name, a => a, StringComparer.OrdinalIgnoreCase);
+            var gacAssembliesByName = gacAssemblies
+                .GroupBy(ad=>ad.Name, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(g => g.Key, 
+                    g => g.ToDictionary(ad=>ad.Version, ad=>ad),
+                    StringComparer.OrdinalIgnoreCase);
 
             return (gacAssemblies, gacAssembliesByName);
         }
 
         private static (HashSet<AssemblyDesc> available, Dictionary<string, Dictionary<Version, string>> availableWhere,
-        HashSet<AssemblyDesc> required, Dictionary<string, List<AssemblyDesc>> requiredBy,
-        Dictionary<string,Version[]> availableVersions) ScanForAssemblies(Options options)
+            HashSet<AssemblyDesc> required, Dictionary<string, List<AssemblyDesc>> requiredBy,
+            Dictionary<string, Version[]> availableVersions) ScanForAssemblies(Options options,
+                ISet<AssemblyDesc> gacAssemblies)
         {
             var available = new HashSet<AssemblyDesc>();
             var availableWhere = new Dictionary<string, Dictionary<Version, string>>(StringComparer.OrdinalIgnoreCase);
@@ -223,6 +203,10 @@ namespace McDuck.Shibari
                 foreach (var req in assembly.GetReferencedAssemblies())
                 {
                     var reqDesc = new AssemblyDesc(req);
+
+                    if (gacAssemblies.Contains(reqDesc))
+                        continue; // No point even caring about it
+
                     required.Add(reqDesc);
                     if (!requiredBy.ContainsKey(reqDesc.Name))
                         requiredBy.Add(reqDesc.Name, new List<AssemblyDesc>());
@@ -231,7 +215,7 @@ namespace McDuck.Shibari
                 }
             }
 
-            var availableVersions = available
+            var availableVersions = available.Concat(gacAssemblies)
                 .GroupBy(a => a.Name, a => a.Version)
                 .ToDictionary(g => g.Key, g => g.ToArray(), StringComparer.OrdinalIgnoreCase);
 
@@ -288,15 +272,6 @@ namespace McDuck.Shibari
 
         private static class Constants
         {
-            public const string ReferenceAssembliesPath = @"Reference Assemblies\Microsoft\Framework";
-            public const string RedistListPath = "RedistList";
-            public const string RedistListFileName = "FrameworkList.xml";
-            public static class FrameworkDir
-            {
-                public const string NetFramework = ".NETFramework";
-                public const string DotNetCore = ".NETCore";
-            }
-
             public const string WebConfigFileName = "Web.config";
             public const string ConfigExtension = "config";
             public const string ExeExtension = "exe";
@@ -314,6 +289,16 @@ namespace McDuck.Shibari
                 Console.WriteLine(message);
                 Log.LogWarning(message);
             }
+
+            if (!availableWhere.ContainsKey(name))
+            {
+                var message =
+                    $"INFO: {name}: The assembly is only present in the Global Assembly Cache. Will not create a binding.";
+                Console.WriteLine(message);
+                Log.LogInformation(message);
+                return null;
+            }
+
             var dependent = new DependentAssembly
             {
                 Name = name,
@@ -321,15 +306,16 @@ namespace McDuck.Shibari
                 Redirects = CreateBindingRedirects(required, available).ToHashSet()
             };
 
-            dependent.CodeBases = CreateCodeBases(dependent.Redirects.Select(r => r.New).ToArray(), availableWhere[name], basePath).ToHashSet();
+            dependent.CodeBases = CreateCodeBases(name, dependent.Redirects.Select(r => r.New).ToArray(),
+                    availableWhere[name], basePath).ToHashSet();
 
             return dependent;
 
         }
 
-        private static IEnumerable<BindingRedirect> CreateBindingRedirects(Version[] required, Version[] available)
+        private static IEnumerable<BindingRedirect> CreateBindingRedirects(IEnumerable<Version> required, IReadOnlyCollection<Version> available)
         {
-            if (available.Length == 1)
+            if (available.Count == 1)
             {
                 yield return new BindingRedirect { Min = Version.Parse("0.0.0.0"), Max = required.Max(), New = available.Single() };
             }
@@ -348,6 +334,9 @@ namespace McDuck.Shibari
                 var max = reqE.Current;
                 do
                 {
+                    while (reqE.Current > avaE.Current && avaE.MoveNext())
+                        neu = avaE.Current;
+
                     while (reqE.MoveNext() && reqE.Current <= avaE.Current)
                         max = reqE.Current;
 
@@ -356,7 +345,7 @@ namespace McDuck.Shibari
 
                     if (avaE.MoveNext())
                     {
-                        // we have another one, so we can now emit
+                        // we have another one, so we can now emit, but only
                         yield return new BindingRedirect { Min = min, Max = max, New = neu };
 
                         // Set next available
@@ -373,7 +362,7 @@ namespace McDuck.Shibari
 
                         // no! so just in theory we probably can emit the final as the latest version available
                         min = avaE.Current;
-                        while (avaE.MoveNext()) ;
+                        while (avaE.MoveNext()) { }
                         yield return new BindingRedirect { Min = min, Max = avaE.Current, New = avaE.Current };
                         yield break;
                     }
@@ -391,19 +380,38 @@ namespace McDuck.Shibari
 
         }
 
-        private static IEnumerable<CodeBase> CreateCodeBases(Version[] versions, Dictionary<Version, string> availableWhere, string basePath)
+        private static IEnumerable<CodeBase> CreateCodeBases(string name, Version[] versions, Dictionary<Version, string> availableWhere, string basePath)
         {
             if (versions.Length < 2) yield break;
 
             foreach (var version in versions)
-                yield return new CodeBase { Version = version, RelativePath = GetRelativePath(basePath, availableWhere[version]) };
+            {
+                if (!availableWhere.ContainsKey(version))
+                {
+                    var message =
+                        $"INFO: {name}@{version}: The assembly version is only present in the Global Assembly Cache. Will not create a binding.";
+                    Console.WriteLine(message);
+                    Log.LogInformation(message);
+                    continue;
+                }
+                yield return new CodeBase
+                    {Version = version, RelativePath = GetRelativePath(basePath, availableWhere[version])};
+            }
         }
 
         private static string GetRelativePath(string fromPath, string toPath)
         {
+            try
+            {
 #if NETFRAMEWORK
             if (String.IsNullOrEmpty(fromPath)) throw new ArgumentNullException("fromPath");
 	        if (String.IsNullOrEmpty(toPath)) throw new ArgumentNullException("toPath");
+
+
+            if (!Path.IsPathRooted(fromPath))
+                fromPath = Path.GetFullPath(fromPath);
+            if (!Path.IsPathRooted(toPath))
+                toPath = Path.GetFullPath(toPath);
 
 	        Uri fromUri = new Uri(fromPath);
 	        Uri toUri = new Uri(toPath);
@@ -420,8 +428,14 @@ namespace McDuck.Shibari
 
 	        return relativePath;
 #else
-            return Path.GetRelativePath(fromPath, toPath);
+                return Path.GetRelativePath(fromPath, toPath);
 #endif
+            }
+            catch
+            {
+                Console.WriteLine($"{nameof(GetRelativePath)}({fromPath}, {toPath}): Error!");
+                throw;
+            }
         }
     }
 }

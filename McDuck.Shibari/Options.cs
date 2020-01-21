@@ -6,16 +6,7 @@ namespace McDuck.Shibari
     {
         [Option('p', "path", Required = true, HelpText = "Path to the folder with the built application")]
         public string PathToDir { get; set; }
-
-        [Option("core", Required = false, Default = false, HelpText = "Use the .NET Core as the target framework for execution of the target application")]
-        public bool Core { get; set; }
-
-        [Option("framework", Required = false, Default = false, HelpText = "Use the .NET Framework as the target framework for execution of the target application")]
-        public bool Framework { get; set; }
-
-        [Option('t',"targetversion", Required = true, HelpText="Specify the version of the framework that the application will execute against")]
-        public string FrameworkVersion { get; set; }
-
+        
         [Option('e', "entry", Required = false, HelpText = "Specify to start resolving dependencies from a specific dll, instead of scanning entire target directory")]
         public string EntryAssemblyDll { get; set; }
 
